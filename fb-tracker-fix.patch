@@ -1,0 +1,2570 @@
+diff --git a/README.md b/README.md
+index 88abd4f..46230ad 100644
+--- a/README.md
++++ b/README.md
+@@ -10,7 +10,8 @@ Built with **Python**, **PyQt6 (Windows 11 Fluent Dark Theme)**, and **Chrome De
+ 
+ - **Windows 11 Fluent Dark Design**: Custom dark acrylic UI with real-time colored CDP console logs, animated progress indicators, and statistics summary cards.
+ - **Dedicated CDP Chrome Launcher**:
+-  - One-click **"🚀 Launch CDP Chrome"** button starts a clean Chrome instance with `--remote-debugging-port=9222` and isolated profile so it reliably enables CDP even if regular Chrome windows are already open.
++  - One-click **"🚀 Launch CDP Chrome"** button starts a clean Chrome instance with `--remote-debugging-port=9222 --remote-allow-origins=*` and an isolated profile so it reliably enables CDP even if regular Chrome windows are already open.
++  - Opens `facebook.com/messages` (not `messenger.com`) — only facebook.com hosts the Messenger UI the audit reads, and that is the tab you are signed into.
+ - **Dynamic Tab Selection (No Hardcoding)**:
+   - **Multiple Prospect Sheet Tabs**: Select 1 or more daily prospect sheets (e.g. "OCT 27 FB PROSPECTS") with multi-select checkboxes or "Select All".
+   - **Messenger Tab Selector**: Dropdown with automatic smart detection for your active Facebook Messenger chat tab.
+@@ -22,7 +23,7 @@ Built with **Python**, **PyQt6 (Windows 11 Fluent Dark Theme)**, and **Chrome De
+     - Confirmed reply $\rightarrow$ `Hot - Follow Up`
+     - DM'd without reply $\rightarrow$ `Pending`
+     - Follower priority $\ge 100 \rightarrow$ `High`, $10\text{–}99 \rightarrow$ `Medium`, $<10 \rightarrow$ `Low`
+-  - **Daily Sheet Cleanup**: Automatically removes rows of prospects who were not DM'd.
++  - **Daily Sheet Holds**: Rows of prospects who were not DM'd are never deleted — they stay in place and get a `HOLD <date>` mark in a Hold column, so you can retry them later.
+   - **Master Sheet Append**: Writes DM'd records into the master sheet following columns `A` through `L` (`Initial Contact Date`, `Status`, `Priority`, `Owner`, `Company`, `Social Link`, `Website`, `Email`, `Phone`, `Notes`).
+   - **Formula-Bar Verified Editing**: Uses verified formula-bar focusing and commit keys to avoid Google Sheets corruption.
+   - **Clipboard Integration**: Copies `done` to clipboard upon completion.
+@@ -50,8 +51,37 @@ pyinstaller --noconfirm --onefile --windowed --name "FBProspectTracker_Standalon
+ 
+ ---
+ 
++## 🩺 Troubleshooting
++
++**Stuck at 5% "Connecting to Chrome DevTools tabs..."**
++Chrome 128+ silently drops DevTools sockets that it does not allowlist, and some clients get
++rejected because of the `permessage-deflate` WebSocket extension. The app now disables that
++extension, adds `--remote-allow-origins=*` when it launches Chrome, and puts a timeout on every
++DevTools command — a dead connection now fails with a clear message instead of hanging forever.
++If you start Chrome by hand, use:
++
++```powershell
++chrome.exe --remote-debugging-port=9222 --remote-allow-origins=* --user-data-dir="%LOCALAPPDATA%\ChromeCDPProfile"
++```
++
++**Nothing is logged / "Task Completed" with zeros**
++The sheet could not be read. Chrome must be signed into the Google account that owns the sheet.
++The run now logs which read strategy worked (CSV export, gviz CSV, or clipboard copy) and refuses
++to report success when no rows were found.
++
++**Prospect not found in Messenger**
++Use `https://www.facebook.com/messages/` and leave the conversation list visible. Rows whose
++thread could not be read are left untouched and listed as "needs review" instead of being held or deleted.
++
++**How the DM check works**
++The run first reads and scrolls your whole Messenger conversation list (pausing ~3.5s after each
++scroll so the next batch loads) and indexes every thread it sees. Each prospect is looked up in
++that index and the matching thread is opened and read; Messenger search is only used when the
++scan cannot see them. If the list cannot be scanned at all, unverified rows are reported as
++"needs review" rather than assumed to be un-DM'd.
++
+ ## 📋 Technical Playbook Rules Followed
+ - **Messenger is the source of truth.**
+ - Follower count rules applied for lead prioritization.
+-- Safety checks before cell writing and row deletion.
++- Safety checks before every cell write, plus a read-back verification of both sheets.
+ - Automated clipboard write: `Set-Clipboard -Value "done"`.
+diff --git a/cdp_engine.py b/cdp_engine.py
+index 3c13824..0866cc5 100644
+--- a/cdp_engine.py
++++ b/cdp_engine.py
+@@ -1,171 +1,738 @@
+ """
+ CDP Automation Engine for Facebook Prospect Tracker
+-Implements the exact technical playbook specified in the prompt:
+-- Remote debugging endpoint connection (ws / json/list)
++Implements the technical playbook:
++- Remote debugging endpoint connection (ws / json/list) with real timeouts
+ - Formula bar focused editing with verification
+ - Messenger audit and status extraction
+ - Safe row deletion and cell updates
+ - CSV export verification using authenticated Chrome session
+ """
+ 
+-import os
+-import sys
++import asyncio
++import io
++import csv
+ import json
+-import time
+ import re
+ import urllib.request
+-import urllib.parse
+-from datetime import datetime
+-import asyncio
++
+ import websockets
+ 
+ CDP_BASE_URL = "http://127.0.0.1:9222"
++DEFAULT_TIMEOUT = 20.0  # seconds for a single CDP command
++
++_SHIFTED = set('_:+~"<>?{}|!@#$%^&*()')
++_PUNCTUATION = {
++    " ": ("Space", 32),
++    ".": ("Period", 190),
++    ",": ("Comma", 188),
++    "-": ("Minus", 189),
++    "_": ("Minus", 189),
++    "=": ("Equal", 187),
++    "+": ("Equal", 187),
++    "/": ("Slash", 191),
++    "?": ("Slash", 191),
++    ";": ("Semicolon", 186),
++    ":": ("Semicolon", 186),
++    "'": ("Quote", 222),
++    '"': ("Quote", 222),
++    "[": ("BracketLeft", 219),
++    "{": ("BracketLeft", 219),
++    "]": ("BracketRight", 221),
++    "}": ("BracketRight", 221),
++    "\\": ("Backslash", 220),
++    "|": ("Backslash", 220),
++    "`": ("Backquote", 192),
++    "~": ("Backquote", 192),
++    "<": ("Comma", 188),
++    ">": ("Period", 190),
++    "!": ("Digit1", 49),
++    "@": ("Digit2", 50),
++    "#": ("Digit3", 51),
++    "$": ("Digit4", 52),
++    "%": ("Digit5", 53),
++    "^": ("Digit6", 54),
++    "&": ("Digit7", 55),
++    "*": ("Digit8", 56),
++    "(": ("Digit9", 57),
++    ")": ("Digit0", 48),
++}
++
++
++def describe_key(ch):
++    """Returns (key, code, virtual_key_code, modifiers) for a character."""
++    if ch in _PUNCTUATION:
++        code, vk = _PUNCTUATION[ch]
++        modifiers = 8 if ch in _SHIFTED else 0
++        return ch, code, vk, modifiers
++    if ch.isdigit():
++        return ch, f"Digit{ch}", ord(ch), 0
++    lower = ch.lower()
++    if lower.isalpha():
++        return ch, f"Key{lower.upper()}", ord(lower.upper()), 8 if ch.isupper() else 0
++    return ch, "Unidentified", 0, 0
++
++
++class CDPError(RuntimeError):
++    """Raised whenever the DevTools connection cannot do what was asked."""
++
++
++# ---------------------------------------------------------------------------
++# CDP client
++# ---------------------------------------------------------------------------
+ 
+ class CDPClient:
+-    def __init__(self, ws_url):
++    def __init__(self, ws_url, name="tab"):
+         self.ws_url = ws_url
++        self.name = name
+         self.ws = None
+         self._msg_id = 0
+         self._pending = {}
++        self._listen_task = None
++        self._closed_reason = None
+ 
+-    async def connect(self):
+-        self.ws = await websockets.connect(self.ws_url, max_size=50 * 1024 * 1024)
+-        asyncio.create_task(self._listen())
++    # -- connection ---------------------------------------------------------
++    async def connect(self, timeout=DEFAULT_TIMEOUT):
++        try:
++            self.ws = await websockets.connect(
++                self.ws_url,
++                max_size=50 * 1024 * 1024,
++                # Chrome's DevTools endpoint rejects the permessage-deflate
++                # extension on recent builds, which shows up as a socket that
++                # opens and dies immediately. Disabling it keeps the handshake
++                # plain.
++                compression=None,
++                open_timeout=timeout,
++                close_timeout=5,
++                ping_interval=None,
++            )
++        except asyncio.TimeoutError:
++            raise CDPError(
++                f"Timed out after {timeout:.0f}s opening the DevTools socket for the "
++                f"{self.name} tab. Chrome is not answering on "
++                f"{self.ws_url}. Close that tab, press Refresh Tabs and try again."
++            )
++        except Exception as e:
++            raise CDPError(
++                f"Could not open the DevTools socket for the {self.name} tab ({e}). "
++                f"If Chrome was started by hand, relaunch it with "
++                f"--remote-debugging-port=9222 --remote-allow-origins=*"
++            )
++        self._listen_task = asyncio.create_task(self._listen())
+ 
+     async def _listen(self):
++        reason = "DevTools socket closed"
+         try:
+             async for raw in self.ws:
+-                msg = json.loads(raw)
++                try:
++                    msg = json.loads(raw)
++                except Exception:
++                    continue
+                 msg_id = msg.get("id")
+-                if msg_id in self._pending:
++                if msg_id is not None and msg_id in self._pending:
+                     future = self._pending.pop(msg_id)
+                     if not future.done():
+                         future.set_result(msg)
+-        except Exception:
+-            pass
++        except asyncio.CancelledError:
++            reason = "DevTools socket cancelled"
++            raise
++        except Exception as e:
++            reason = f"DevTools socket closed: {e}"
++        finally:
++            self._closed_reason = reason
++            self._fail_pending(reason)
++
++    def _fail_pending(self, reason):
++        for future in list(self._pending.values()):
++            if not future.done():
++                future.set_exception(
++                    CDPError(f"{reason} (while waiting on the {self.name} tab)")
++                )
++        self._pending.clear()
++
++    async def close(self):
++        if self._listen_task:
++            self._listen_task.cancel()
++            try:
++                await self._listen_task
++            except (asyncio.CancelledError, Exception):
++                pass
++            self._listen_task = None
++        if self.ws:
++            try:
++                await self.ws.close()
++            except Exception:
++                pass
++            self.ws = None
++
++    # -- commands -----------------------------------------------------------
++    async def send(self, method, params=None, timeout=DEFAULT_TIMEOUT):
++        if self.ws is None:
++            raise CDPError(f"Not connected to the {self.name} tab.")
++        if self._closed_reason:
++            raise CDPError(self._closed_reason)
+ 
+-    async def send(self, method, params=None):
+-        if params is None:
+-            params = {}
+         self._msg_id += 1
+         msg_id = self._msg_id
+-        future = asyncio.get_event_loop().create_future()
++        future = asyncio.get_running_loop().create_future()
+         self._pending[msg_id] = future
+-        await self.ws.send(json.dumps({"id": msg_id, "method": method, "params": params}))
+-        res = await future
+-        return res
+-
+-    async def evaluate(self, expr, await_promise=True):
+-        res = await self.send("Runtime.evaluate", {
+-            "expression": expr,
+-            "returnByValue": True,
+-            "awaitPromise": await_promise
+-        })
+-        if "result" in res and "result" in res["result"]:
+-            return res["result"]["result"].get("value")
+-        return None
++        payload = {"id": msg_id, "method": method, "params": params or {}}
++        try:
++            await self.ws.send(json.dumps(payload))
++        except Exception as e:
++            self._pending.pop(msg_id, None)
++            raise CDPError(f"Could not send {method} to the {self.name} tab: {e}")
++
++        try:
++            response = await asyncio.wait_for(future, timeout)
++        except asyncio.TimeoutError:
++            self._pending.pop(msg_id, None)
++            raise CDPError(
++                f"No reply from the {self.name} tab for {method} within "
++                f"{timeout:.0f}s. The tab is probably hung, closed, or showing a "
++                f"browser dialog."
++            )
++
++        if "error" in response:
++            err = response["error"]
++            raise CDPError(
++                f"{method} failed on the {self.name} tab: "
++                f"{err.get('message')} {err.get('data', '')}".strip()
++            )
++        return response.get("result", {})
++
++    async def evaluate(self, expr, await_promise=True, timeout=DEFAULT_TIMEOUT):
++        result = await self.send(
++            "Runtime.evaluate",
++            {"expression": expr, "returnByValue": True, "awaitPromise": await_promise},
++            timeout=timeout,
++        )
++        inner = result.get("result", {})
++        if "exceptionDetails" in result:
++            details = result["exceptionDetails"]
++            text = details.get("text", "JavaScript error")
++            desc = details.get("exception", {}).get("description", "")
++            raise CDPError(f"Page script failed on the {self.name} tab: {text} {desc}")
++        return inner.get("value")
+ 
+     async def bring_to_front(self):
+         await self.send("Page.bringToFront")
+         await asyncio.sleep(0.3)
+ 
+-    async def key_down_up(self, key, code, vk=None):
+-        extra = {}
++    # -- input helpers ------------------------------------------------------
++    async def press_key(self, key, code, vk=None, modifiers=0):
++        extra = {"modifiers": modifiers}
+         if vk is not None:
+             extra["windowsVirtualKeyCode"] = vk
+             extra["nativeVirtualKeyCode"] = vk
+-        await self.send("Input.dispatchKeyEvent", {"type": "rawKeyDown", "key": key, "code": code, **extra})
++        await self.send(
++            "Input.dispatchKeyEvent",
++            {"type": "rawKeyDown", "key": key, "code": code, **extra},
++        )
+         await self.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": key, "code": code, **extra})
+ 
++    async def press_enter(self):
++        await self.send(
++            "Input.dispatchKeyEvent",
++            {
++                "type": "keyDown",
++                "key": "Enter",
++                "code": "Enter",
++                "text": "\r",
++                "unmodifiedText": "\r",
++                "windowsVirtualKeyCode": 13,
++                "nativeVirtualKeyCode": 13,
++            },
++        )
++        await self.send(
++            "Input.dispatchKeyEvent",
++            {
++                "type": "keyUp",
++                "key": "Enter",
++                "code": "Enter",
++                "windowsVirtualKeyCode": 13,
++                "nativeVirtualKeyCode": 13,
++            },
++        )
++
++    async def press_escape(self):
++        await self.press_key("Escape", "Escape", vk=27)
++
++    async def ctrl(self, key, code, vk):
++        await self.send(
++            "Input.dispatchKeyEvent",
++            {
++                "type": "rawKeyDown",
++                "key": key,
++                "code": code,
++                "modifiers": 2,
++                "windowsVirtualKeyCode": vk,
++                "nativeVirtualKeyCode": vk,
++            },
++        )
++        await self.send(
++            "Input.dispatchKeyEvent",
++            {
++                "type": "keyUp",
++                "key": key,
++                "code": code,
++                "modifiers": 2,
++                "windowsVirtualKeyCode": vk,
++                "nativeVirtualKeyCode": vk,
++            },
++        )
++
++    async def select_all(self):
++        await self.ctrl("a", "KeyA", 65)
++
++    async def copy(self):
++        await self.ctrl("c", "KeyC", 67)
++
++    async def paste(self):
++        await self.ctrl("v", "KeyV", 86)
++
++    async def delete_rows_shortcut(self):
++        """Ctrl+Alt+- on a selected row range deletes those rows in Google Sheets."""
++        for kind in ("rawKeyDown", "keyUp"):
++            await self.send(
++                "Input.dispatchKeyEvent",
++                {
++                    "type": kind,
++                    "key": "-",
++                    "code": "Minus",
++                    "modifiers": 3,  # Alt(1) + Ctrl(2)
++                    "windowsVirtualKeyCode": 189,
++                    "nativeVirtualKeyCode": 189,
++                },
++            )
++        await asyncio.sleep(0.6)
++
++    async def scroll_at(self, x, y, delta_y, times=1, pause=0.35):
++        """Scrolls with real wheel events - lazy lists (Messenger's) only load on those."""
++        await self.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
++        for _ in range(max(1, times)):
++            await self.send(
++                "Input.dispatchMouseEvent",
++                {"type": "mouseWheel", "x": x, "y": y, "deltaX": 0, "deltaY": delta_y},
++            )
++            await asyncio.sleep(pause)
++
++    async def navigate(self, url):
++        await self.send("Page.navigate", {"url": url})
++        await asyncio.sleep(0.4)
++
+     async def click(self, x, y, count=1, button="left"):
+-        await self.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": button, "clickCount": count})
+-        await self.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": button, "clickCount": count})
++        await self.send(
++            "Input.dispatchMouseEvent",
++            {"type": "mouseMoved", "x": x, "y": y},
++        )
++        await self.send(
++            "Input.dispatchMouseEvent",
++            {"type": "mousePressed", "x": x, "y": y, "button": button, "clickCount": count},
++        )
++        await self.send(
++            "Input.dispatchMouseEvent",
++            {"type": "mouseReleased", "x": x, "y": y, "button": button, "clickCount": count},
++        )
+ 
+-    async def type_text(self, text):
++    async def type_text(self, text, delay=0.012):
++        """
++        Types into whatever currently has focus using full key events.
++
++        A bare ``char`` event is not enough for Google Sheets: the grid only
++        starts editing a cell from a keyDown, so a char-only sequence is
++        silently swallowed.
++        """
+         for ch in str(text):
+-            await self.send("Input.dispatchKeyEvent", {"type": "char", "text": ch})
+-            await asyncio.sleep(0.015)
+-
+-    async def commit_enter(self):
+-        await self.send("Input.dispatchKeyEvent", {
+-            "type": "rawKeyDown", "key": "Enter", "code": "Enter",
+-            "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13
+-        })
+-        await self.send("Input.dispatchKeyEvent", {"type": "char", "text": "\r"})
+-        await self.send("Input.dispatchKeyEvent", {
+-            "type": "keyUp", "key": "Enter", "code": "Enter",
+-            "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13
+-        })
+-
+-    async def escape_revert(self):
+-        await self.key_down_up("Escape", "Escape", vk=27)
+-        await asyncio.sleep(0.2)
+-        await self.key_down_up("Escape", "Escape", vk=27)
++            if ch in ("\n", "\r"):
++                continue
++            key, code, vk, modifiers = describe_key(ch)
++            await self.send(
++                "Input.dispatchKeyEvent",
++                {
++                    "type": "keyDown",
++                    "key": key,
++                    "code": code,
++                    "text": ch,
++                    "unmodifiedText": ch,
++                    "windowsVirtualKeyCode": vk,
++                    "nativeVirtualKeyCode": vk,
++                    "modifiers": modifiers,
++                },
++            )
++            await self.send(
++                "Input.dispatchKeyEvent",
++                {
++                    "type": "keyUp",
++                    "key": key,
++                    "code": code,
++                    "windowsVirtualKeyCode": vk,
++                    "nativeVirtualKeyCode": vk,
++                    "modifiers": modifiers,
++                },
++            )
++            if delay:
++                await asyncio.sleep(delay)
+ 
+-    async def close(self):
+-        if self.ws:
+-            await self.ws.close()
++    async def insert_text(self, text):
++        """Inserts text into the focused editable element in one shot."""
++        await self.send("Input.insertText", {"text": str(text)})
+ 
++    # -- Google Sheets helpers ---------------------------------------------
++    async def set_name_box(self, ref, timeout=6.0):
++        """
++        Types ``ref`` (a cell like A5, or a row range like 5:7) into the Sheets
++        name box and commits it. Returns the value the box ends up showing.
++        """
++        focused = await self.evaluate(
++            """
++            (() => {
++                const nb = document.querySelector('.waffle-name-box')
++                        || document.querySelector('#t-name-box')
++                        || document.querySelector('input[aria-label="Name box"]');
++                if (!nb) return false;
++                nb.focus();
++                if (nb.select) nb.select();
++                return document.activeElement === nb || document.activeElement === nb.querySelector('input');
++            })()
++            """
++        )
++        if not focused:
++            raise CDPError("Google Sheets name box was not found on this tab.")
+ 
+-def get_tabs(port=9222):
++        await self.select_all()
++        await self.type_text(ref, delay=0.03)
++        await asyncio.sleep(0.15)
++        await self.press_enter()
++        await asyncio.sleep(0.35)
++
++        value = await self.evaluate(
++            """
++            (() => {
++                const nb = document.querySelector('.waffle-name-box')
++                        || document.querySelector('#t-name-box')
++                        || document.querySelector('input[aria-label="Name box"]');
++                return nb ? (nb.value || '') : '';
++            })()
++            """
++        )
++        return (value or "").strip()
++
++    async def grant_clipboard_read(self):
++        try:
++            await self.send(
++                "Browser.grantPermissions",
++                {
++                    "origin": "https://docs.google.com",
++                    "permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"],
++                },
++            )
++            return True
++        except CDPError:
++            return False
++
++
++# ---------------------------------------------------------------------------
++# Target discovery
++# ---------------------------------------------------------------------------
++
++def fetch_targets(port=9222):
++    """Returns (tabs, error_message)."""
++    url = f"http://127.0.0.1:{port}/json/list"
+     try:
+-        url = f"http://127.0.0.1:{port}/json/list"
+         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+         with urllib.request.urlopen(req, timeout=3) as resp:
+-            data = resp.read().decode('utf-8')
+-            return json.loads(data)
++            data = json.loads(resp.read().decode("utf-8"))
++        return data, None
+     except Exception as e:
+-        return []
++        return [], str(e)
++
++
++def get_tabs(port=9222):
++    tabs, _ = fetch_targets(port)
++    return tabs
++
++
++def resolve_ws_url(tab, port=9222):
++    """
++    Re-reads the target list so a stale webSocketDebuggerUrl (tab reloaded,
++    Chrome restarted) does not wedge the run.
++    """
++    tabs, _ = fetch_targets(port)
++    target_id = tab.get("id")
++    for candidate in tabs:
++        if target_id and candidate.get("id") == target_id:
++            return candidate.get("webSocketDebuggerUrl") or tab.get("webSocketDebuggerUrl")
++    return tab.get("webSocketDebuggerUrl")
++
++
++async def connect_tab(tab, name, log=None, port=9222):
++    """Connects to a tab, retrying once with a freshly resolved socket URL."""
++    ws_url = tab.get("webSocketDebuggerUrl")
++    if not ws_url:
++        raise CDPError(
++            f"The {name} tab has no DevTools socket URL. Press Refresh Tabs."
++        )
++    client = CDPClient(ws_url, name=name)
++    try:
++        await client.connect()
++        return client
++    except CDPError as first_error:
++        if log:
++            log(f"{name} tab: {first_error} Retrying with a fresh target list...", "warning")
++        await client.close()
++        fresh = resolve_ws_url(tab, port=port)
++        if not fresh or fresh == ws_url:
++            raise
++        client = CDPClient(fresh, name=name)
++        await client.connect()
++        return client
++
+ 
++# ---------------------------------------------------------------------------
++# Sheet data helpers (pure functions, unit testable)
++# ---------------------------------------------------------------------------
+ 
+-def parse_csv(csv_text):
+-    """Simple and robust CSV parser handling quotes and newlines."""
+-    import csv
+-    import io
+-    reader = csv.reader(io.StringIO(csv_text))
++def parse_csv(csv_text, delimiter=","):
++    reader = csv.reader(io.StringIO(csv_text), delimiter=delimiter)
+     return [row for row in reader]
+ 
+ 
+-def extract_doc_and_gid(url):
+-    """Extract Google Sheets Doc ID and GID from URL."""
+-    doc_match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url)
+-    gid_match = re.search(r'[#&?]gid=([0-9]+)', url)
+-    doc_id = doc_match.group(1) if doc_match else None
+-    gid = gid_match.group(1) if gid_match else "0"
+-    return doc_id, gid
++def looks_like_html(text):
++    head = (text or "").lstrip()[:200].lower()
++    return head.startswith("<") or "<html" in head or "<!doctype" in head
++
++
++def clean_rows(raw_rows, delimiter=","):
++    """Drops fully empty rows and normalises cell whitespace."""
++    rows = []
++    for row in raw_rows:
++        cells = [norm(c) for c in row]
++        if any(cells):
++            rows.append(cells)
++    return rows
++
++
++def norm(value):
++    return str(value if value is not None else "").replace("\u00a0", " ").replace("\n", " ").strip()
++
++
++HEADER_RULES = (
++    ("followers", ("follower", "followers", "audience")),
++    ("email", ("email", "e-mail", "mail")),
++    ("phone", ("phone", "mobile", "contact number", "whatsapp")),
++    ("location", ("location", "city", "state", "address", "area")),
++    ("facebook", ("facebook", "fb ", " fb", "profile", "social", "page link", "messenger")),
++    ("website", ("website", "web site", "site", "domain", "url", "link")),
++    ("company", ("company", "business", "brand", "page name", "name", "prospect", "client")),
++)
++
++
++def map_columns(header):
++    """Maps our field names to column indexes using the header row."""
++    mapping = {}
++    used = set()
++    lowered = [norm(h).lower() for h in header]
++
++    for field, keywords in HEADER_RULES:
++        for idx, name in enumerate(lowered):
++            if idx in used or not name:
++                continue
++            if any(k in name for k in keywords):
++                mapping[field] = idx
++                used.add(idx)
++                break
++
++    # Positional fallbacks so an unusual header still works
++    fallbacks = ["company", "facebook", "website", "email", "phone", "followers", "location"]
++    for field in fallbacks:
++        if field not in mapping:
++            for idx in range(len(header)):
++                if idx not in used:
++                    mapping[field] = idx
++                    used.add(idx)
++                    break
++    return mapping
++
++
++def calculate_priority(followers_count):
++    """>=100 High, 10-99 Medium, otherwise Low."""
++    digits = re.sub(r"[^0-9]", "", str(followers_count))
++    if not digits:
++        return "Low"
++    count = int(digits)
++    if count >= 100:
++        return "High"
++    if count >= 10:
++        return "Medium"
++    return "Low"
++
++
++def normalize_name(value):
++    text = norm(value).lower()
++    text = re.sub(r"https?://", " ", text)
++    text = re.sub(r"[^a-z0-9\s]", " ", text)
++    text = re.sub(r"\s+", " ", text).strip()
++    return text
++
++
++def name_matches(query, candidate, threshold=0.6):
++    """Fuzzy check that a conversation title is the prospect we searched for."""
++    q = normalize_name(query)
++    c = normalize_name(candidate)
++    if not q or not c:
++        return False
++    if q == c or q in c or c in q:
++        return True
++    q_tokens = {t for t in q.split() if len(t) > 2}
++    c_tokens = {t for t in c.split() if len(t) > 2}
++    if not q_tokens:
++        return False
++    overlap = len(q_tokens & c_tokens) / len(q_tokens)
++    return overlap >= threshold
++
++
++def analyze_thread(messages):
++    """
++    messages: list of {"text": str, "out": bool} oldest -> newest.
++    Returns (is_dmd, replied, reply_text, incoming_texts).
++    """
++    outgoing = [m for m in messages if m.get("out")]
++    incoming_texts = [m["text"] for m in messages if not m.get("out") and m.get("text")]
++    is_dmd = len(outgoing) > 0
++    replied = False
++    reply_text = ""
+ 
++    if is_dmd:
++        last_out = max(i for i, m in enumerate(messages) if m.get("out"))
++        after = [m for m in messages[last_out + 1:] if not m.get("out") and m.get("text")]
++        if after:
++            replied = True
++            reply_text = after[-1]["text"]
++    return is_dmd, replied, reply_text, incoming_texts
+ 
+-async def export_sheet_csv(cdp: CDPClient, doc_id, gid):
++
++def sheet_export_url(doc_id, gid):
++    return (
++        f"https://docs.google.com/spreadsheets/d/{doc_id}/export"
++        f"?format=csv&gid={gid}"
++    )
++
++
++def sheet_gviz_url(doc_id, gid):
++    return f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&gid={gid}"
++
++
++async def fetch_text(cdp, url, timeout=DEFAULT_TIMEOUT):
+     script = f"""
+     (async () => {{
+         try {{
+-            const url = 'https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv&gid={gid}&cb=' + Date.now();
+-            const r = await fetch(url, {{ credentials: 'include' }});
+-            return await r.text();
+-        }} catch(e) {{
+-            return 'ERROR: ' + e.toString();
++            const r = await fetch({json.dumps(url)}, {{ credentials: 'include', cache: 'no-store' }});
++            const body = await r.text();
++            return {{ ok: r.ok, status: r.status,
++                     type: r.headers.get('content-type') || '',
++                     body: body }};
++        }} catch (e) {{
++            return {{ ok: false, status: 0, type: '', body: 'ERROR: ' + e.toString() }};
+         }}
+     }})()
+     """
+-    res = await cdp.evaluate(script)
+-    return res
+-
+-
+-async def get_active_sheet_tabs_info(cdp: CDPClient):
+-    """Extract list of visible tab names and gids in the current Google Sheets page."""
+-    script = """
+-    (() => {
+-        const tabs = [];
+-        const items = document.querySelectorAll('.docs-sheet-tab');
+-        items.forEach(el => {
+-            const nameEl = el.querySelector('.docs-sheet-tab-name');
+-            const name = nameEl ? nameEl.innerText.trim() : el.innerText.trim();
+-            // Try to find tab id/gid from attributes
+-            const tabId = el.getAttribute('tab-id') || el.getAttribute('data-sheet-id') || el.id || '';
+-            const isActive = el.classList.contains('docs-sheet-active-tab');
+-            tabs.push({ name, tabId, isActive });
+-        });
+-        return tabs;
+-    })()
++    result = await cdp.evaluate(script, timeout=timeout)
++    if not isinstance(result, dict):
++        return {"ok": False, "status": 0, "type": "", "body": ""}
++    return result
++
++
++def extract_doc_and_gid(url):
++    """Extract Google Sheets Doc ID and GID from URL."""
++    doc_match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url or "")
++    gid_match = re.search(r"[#&?]gid=([0-9]+)", url or "")
++    doc_id = doc_match.group(1) if doc_match else None
++    gid = gid_match.group(1) if gid_match else "0"
++    return doc_id, gid
++
++
++async def read_sheet(cdp, doc_id, gid, log=None, timeout=DEFAULT_TIMEOUT):
++    """
++    Reads a sheet as a list of rows using three strategies:
++    1. CSV export endpoint (fast, exact)
++    2. gviz CSV endpoint
++    3. Select-all + copy from the live sheet, then read the clipboard
++    Raises CDPError with a human explanation when every strategy fails.
+     """
+-    return await cdp.evaluate(script)
++    problems = []
++
++    for label, url in (("export", sheet_export_url(doc_id, gid)), ("gviz", sheet_gviz_url(doc_id, gid))):
++        response = await fetch_text(cdp, url, timeout=timeout)
++        body = response.get("body") or ""
++        if not response.get("ok"):
++            problems.append(f"{label}: HTTP {response.get('status')}")
++            continue
++        if looks_like_html(body):
++            problems.append(f"{label}: Google returned a sign-in page instead of CSV")
++            continue
++        rows = clean_rows(parse_csv(body))
++        if rows:
++            if log:
++                log(f"Read {len(rows) - 1} data row(s) from the sheet via {label} CSV.", "info")
++            return rows, f"{label} CSV"
++        problems.append(f"{label}: response was empty")
++
++    # Fallback: copy the used range out of the live sheet
++    if log:
++        log("CSV endpoints unavailable, copying the sheet contents instead...", "warning")
++    try:
++        rows = await copy_sheet_to_rows(cdp, log=log)
++        if rows:
++            return rows, "clipboard copy"
++        problems.append("clipboard: nothing was copied")
++    except CDPError as e:
++        problems.append(f"clipboard: {e}")
++
++    raise CDPError(
++        "Could not read this sheet. " + "; ".join(problems) +
++        ". Make sure Chrome is signed into the Google account that owns the sheet "
++        "and that the tab is fully loaded."
++    )
++
++
++async def copy_sheet_to_rows(cdp, log=None):
++    await cdp.bring_to_front()
++    await cdp.grant_clipboard_read()
++    await cdp.press_escape()
++    await asyncio.sleep(0.2)
++
++    grid = await cdp.evaluate(
++        """
++        (() => {
++            const g = document.querySelector('#t-grid') || document.querySelector('.grid-container');
++            if (!g) return null;
++            const r = g.getBoundingClientRect();
++            return {x: r.left + r.width / 2, y: r.top + Math.min(60, r.height / 2)};
++        })()
++        """
++    )
++    if not grid:
++        raise CDPError("the sheet grid was not found on the page")
++
++    await cdp.click(grid["x"], grid["y"])
++    await asyncio.sleep(0.3)
++    await cdp.select_all()
++    await asyncio.sleep(0.2)
++    await cdp.copy()
++    await asyncio.sleep(1.0)
++
++    text = await cdp.evaluate(
++        """
++        (async () => {
++            try { return await navigator.clipboard.readText(); }
++            catch (e) { return 'ERROR: ' + e.toString(); }
++        })()
++        """
++    )
++    if not isinstance(text, str) or text.startswith("ERROR:"):
++        raise CDPError(f"clipboard read failed ({text})")
++
++    rows = clean_rows(parse_csv(text, delimiter="\t"))
++    if log:
++        log(f"Copied {max(0, len(rows) - 1)} row(s) out of the live sheet.", "info")
++    return rows
+diff --git a/main.py b/main.py
+index 99fd27d..4ee1e1d 100644
+--- a/main.py
++++ b/main.py
+@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
+ from PyQt6.QtCore import Qt, QTimer, QEvent
+ from PyQt6.QtGui import QFont, QIcon, QColor, QTextCursor, QStandardItemModel, QStandardItem
+ 
+-from cdp_engine import get_tabs
++from cdp_engine import fetch_targets
+ from tracker_worker import TrackerWorker
+ 
+ STYLE_SHEET = """
+@@ -510,7 +510,7 @@ class MainWindow(QMainWindow):
+         self.stat_scanned = self.create_stat_box(stats_layout, "0", "Prospects Checked")
+         self.stat_dmd = self.create_stat_box(stats_layout, "0", "DM'd Confirmed")
+         self.stat_replied = self.create_stat_box(stats_layout, "0", "Replies (Hot)")
+-        self.stat_removed = self.create_stat_box(stats_layout, "0", "Removed (No DM)")
++        self.stat_removed = self.create_stat_box(stats_layout, "0", "Held (No DM)")
+         self.stat_appended = self.create_stat_box(stats_layout, "0", "Appended to Master")
+ 
+         right_layout.addWidget(stats_frame)
+@@ -589,7 +589,6 @@ class MainWindow(QMainWindow):
+         return num_label
+ 
+     def log(self, message, level="info"):
+-        timestamp = QTimer().remainingTime() # fallback
+         from datetime import datetime
+         time_str = datetime.now().strftime("%H:%M:%S")
+ 
+@@ -636,10 +635,14 @@ class MainWindow(QMainWindow):
+         cmd = [
+             chosen_path,
+             "--remote-debugging-port=9222",
++            # Chrome 128+ rejects DevTools sockets unless the origin is allowed.
++            "--remote-allow-origins=*",
+             f"--user-data-dir={profile_dir}",
+             "--no-first-run",
+             "--no-default-browser-check",
+-            "https://www.messenger.com",
++            # facebook.com/messages, not messenger.com: only facebook.com hosts the
++            # Messenger UI the automation expects, and you are already signed in there.
++            "https://www.facebook.com/messages/",
+             "https://docs.google.com/spreadsheets"
+         ]
+ 
+@@ -657,55 +660,96 @@ class MainWindow(QMainWindow):
+ 
+     def refresh_tabs(self):
+         self.log("Scanning Chrome CDP endpoint (http://127.0.0.1:9222)...", "info")
+-        tabs = get_tabs(9222)
++        tabs, error = fetch_targets(9222)
+         self.available_tabs = [t for t in tabs if t.get("type") == "page"]
+ 
+         self.prospect_combo.clear_all()
+         self.messenger_combo.clear()
+         self.master_combo.clear()
+ 
+-        if not self.available_tabs:
+-            self.log("No active Chrome tabs detected. Ensure Chrome is running with port 9222.", "warning")
++        if error:
++            self.log(f"Could not reach Chrome DevTools: {error}", "warning")
++            self.log(
++                "Start Chrome with: chrome.exe --remote-debugging-port=9222 --remote-allow-origins=*",
++                "warning",
++            )
+             self.progress_status_label.setText("Status: CDP Chrome not connected (click 'Launch CDP Chrome')")
+             return
+ 
+-        self.log(f"Found {len(self.available_tabs)} active Chrome tab(s).", "success")
+-        self.progress_status_label.setText(f"Connected: {len(self.available_tabs)} tabs available")
+-
+-        # Populate Prospect Lists (Multi-select Dropdown)
+-        default_messenger_idx = 0
+-        default_master_idx = 0
+-
+-        for idx, tab in enumerate(self.available_tabs):
+-            title = tab.get("title", "Untitled")
+-            url = tab.get("url", "")
+-            display_title = title[:60] if title else "Untitled"
+-            display_url = f" ({url[:45]}...)" if len(url) > 45 else (f" ({url})" if url else "")
+-            full_display = f"{display_title}{display_url}"
+-
+-            # Auto-check if matches daily prospect patterns
+-            is_prospect = bool("prospect" in title.lower() or "oct" in title.lower() or "nov" in title.lower() or "sheet" in title.lower())
+-            
+-            # Add to Checkable Dropdown
+-            self.prospect_combo.add_checkable_item(f"📄 {full_display}", user_data=tab, checked=is_prospect)
+-
+-            # Add to dropdowns
+-            self.messenger_combo.addItem(f"💬 {display_title}", tab)
+-            self.master_combo.addItem(f"📊 {display_title}", tab)
++        if not self.available_tabs:
++            self.log("Chrome is running but has no page tabs open.", "warning")
++            self.progress_status_label.setText("Status: no page tabs in the CDP Chrome window")
++            return
+ 
+-            # Auto-select messenger
+-            if "messenger" in url.lower() or "facebook.com/messages" in url.lower() or "messenger" in title.lower():
+-                default_messenger_idx = idx
++        self.log(f"Found {len(self.available_tabs)} page tab(s):", "success")
++
++        sheet_tabs = []
++        messenger_tab = None
++        master_tab = None
++        messenger_index = 0
++        master_index = 0
++
++        for tab in self.available_tabs:
++            title = (tab.get("title") or "Untitled").strip()
++            url = (tab.get("url") or "").strip()
++            lower_title = title.lower()
++            lower_url = url.lower()
++
++            short_url = url[:55] + ("..." if len(url) > 55 else "")
++            display = f"{title[:55]}{f'  ({short_url})' if short_url else ''}"
++            self.log(f"   - {title[:60]}", "info")
++
++            is_sheet = "docs.google.com/spreadsheets" in lower_url
++            is_messenger = (
++                "facebook.com/messages" in lower_url
++                or "messenger.com" in lower_url
++                or ("facebook.com" in lower_url and "/messages" in lower_url)
++            )
+ 
+-            # Auto-select master sheet
+-            if "master" in title.lower() or "tracking" in title.lower():
+-                default_master_idx = idx
++            if messenger_tab is None and is_messenger:
++                messenger_tab = tab
++                messenger_index = self.messenger_combo.count()
++            self.messenger_combo.addItem(f"💬 {display}", tab)
++
++            if is_sheet:
++                sheet_tabs.append(tab)
++                if master_tab is None and ("master" in lower_title or "tracking" in lower_title):
++                    master_tab = tab
++                    master_index = self.master_combo.count()
++                self.master_combo.addItem(f"📊 {display}", tab)
++
++        if not sheet_tabs:
++            self.log(
++                "No Google Sheets tabs found. Open your prospect sheet and Master Sheet in the CDP Chrome window.",
++                "warning",
++            )
++        if messenger_tab is None:
++            self.log(
++                "No Facebook Messenger tab found. Open https://www.facebook.com/messages/ "
++                "(facebook.com, not messenger.com), then press Refresh Tabs.",
++                "warning",
++            )
++        if master_tab is None and sheet_tabs:
++            self.log("No Master Sheet auto-detected (looked for 'master'/'tracking' in the title).", "warning")
++
++        for tab in sheet_tabs:
++            title = (tab.get("title") or "Untitled").strip()
++            url = (tab.get("url") or "").strip()
++            short_url = url[:55] + ("..." if len(url) > 55 else "")
++            display = f"{title[:55]}{f'  ({short_url})' if short_url else ''}"
++            self.prospect_combo.add_checkable_item(
++                f"📄 {display}", user_data=tab, checked=(tab is not master_tab)
++            )
+ 
+-        if self.messenger_combo.count() > default_messenger_idx:
+-            self.messenger_combo.setCurrentIndex(default_messenger_idx)
++        if self.messenger_combo.count():
++            self.messenger_combo.setCurrentIndex(messenger_index)
++        if self.master_combo.count():
++            self.master_combo.setCurrentIndex(master_index)
+ 
+-        if self.master_combo.count() > default_master_idx:
+-            self.master_combo.setCurrentIndex(default_master_idx)
++        self.progress_status_label.setText(
++            f"Connected: {len(sheet_tabs)} sheet(s), "
++            f"{len(self.messenger_combo)} tab(s) selectable"
++        )
+ 
+     def select_all_prospects(self):
+         self.prospect_combo.set_all_checked(True)
+@@ -755,7 +799,8 @@ class MainWindow(QMainWindow):
+             master_tab=master_tab,
+             options={}
+         )
+-        self.worker.log_signal.connect(self.log)
++        # log_signal carries (level, message); MainWindow.log takes (message, level)
++        self.worker.log_signal.connect(lambda level, message: self.log(message, level))
+         self.worker.progress_signal.connect(self.update_progress)
+         self.worker.finished_signal.connect(self.on_worker_finished)
+         self.worker.start()
+@@ -781,7 +826,7 @@ class MainWindow(QMainWindow):
+             self.stat_scanned.setText(str(stats.get("prospects_scanned", 0)))
+             self.stat_dmd.setText(str(stats.get("dmd_count", 0)))
+             self.stat_replied.setText(str(stats.get("replied_count", 0)))
+-            self.stat_removed.setText(str(stats.get("not_dmd_removed", 0)))
++            self.stat_removed.setText(str(stats.get("held_count", 0)))
+             self.stat_appended.setText(str(stats.get("master_appended", 0)))
+ 
+         if success:
+@@ -791,7 +836,7 @@ class MainWindow(QMainWindow):
+                 f"• Prospects Audited: {stats.get('prospects_scanned', 0)}\n"
+                 f"• DM'd Confirmed: {stats.get('dmd_count', 0)}\n"
+                 f"• Hot Follow-Ups: {stats.get('replied_count', 0)}\n"
+-                f"• Removed from daily sheet: {stats.get('not_dmd_removed', 0)}\n"
++                f"• Held in daily sheet (not DM'd): {stats.get('held_count', 0)}\n"
+                 f"• Appended to Master Sheet: {stats.get('master_appended', 0)}\n\n"
+                 f"'done' has been copied to your clipboard."
+             )
+diff --git a/tracker_worker.py b/tracker_worker.py
+index 53dbbab..fc6c79b 100644
+--- a/tracker_worker.py
++++ b/tracker_worker.py
+@@ -1,129 +1,443 @@
+ """
+ Worker thread and Automation Engine executing the Prompt Playbook:
+-1. Messenger Audit
+-2. Daily Sheet filtering (delete rows of uncontacted)
++1. Messenger audit — scrolls your real conversation list, opens the matching
++   thread and reads the messages to see whether you DM'd them
++2. Daily Sheet filtering — rows that were never DM'd are KEPT and marked HOLD
++   (nothing is deleted any more)
+ 3. Append DM'd prospects to Master Sheet with proper fields & formatting
+ 4. Verification & Clipboard copy
++
++Every stage reports exactly what it found and every run is verified by
++re-reading the affected sheet, so "Task Completed" is never shown for a run
++that did nothing.
+ """
+ 
+-import sys
+-import os
+-import re
+-import csv
+-import io
+-import time
+ import asyncio
++import json
++import subprocess
++import sys
+ from datetime import datetime
++from urllib.parse import urljoin
++
+ from PyQt6.QtCore import QThread, pyqtSignal
+ 
+-from cdp_engine import CDPClient, export_sheet_csv, extract_doc_and_gid
++from cdp_engine import (
++    CDPError,
++    analyze_thread,
++    calculate_priority,
++    connect_tab,
++    extract_doc_and_gid,
++    map_columns,
++    name_matches,
++    norm,
++    normalize_name,
++    read_sheet,
++)
+ 
+-def norm(s):
+-    return str(s if s is not None else '').replace('\u00a0', ' ').replace('\n', ' ').strip()
++MASTER_COLUMNS = ("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
++
++# Messenger list scan: how long to let the next batch of threads render, and
++# how many empty passes in a row mean "that's the whole history".
++SCAN_PAUSE = 3.5
++SCAN_MAX_PASSES = 25
++SCAN_STAGNANT_PASSES = 3
++SCAN_WHEEL_DELTA = 700
++
++HOLD_PREFIX = "HOLD"
++
++
++def column_letter(index):
++    """0 -> A, 11 -> L, 26 -> AA."""
++    n = index + 1
++    letters = ""
++    while n > 0:
++        n, rem = divmod(n - 1, 26)
++        letters = chr(65 + rem) + letters
++    return letters or "A"
++
++
++def search_term(company, fb_link):
++    """Best available value to look the prospect up by."""
++    name = norm(company)
++    if name:
++        return name
++    link = norm(fb_link)
++    if not link:
++        return ""
++    tail = link.rstrip("/").split("/")[-1]
++    tail = tail.split("?")[0].replace("-", " ").replace(".", " ").strip()
++    return tail
++
++
++def thread_score(term, candidate):
++    """0.0 when the conversation is not this prospect, higher is a better match."""
++    q = normalize_name(term)
++    c = normalize_name(candidate)
++    if not q or not c:
++        return 0.0
++    if q == c:
++        return 4.0
++    if q in c or c in q:
++        return 3.0
++    q_tokens = {t for t in q.split() if len(t) > 2}
++    c_tokens = {t for t in c.split() if len(t) > 2}
++    if not q_tokens:
++        return 0.0
++    overlap = len(q_tokens & c_tokens) / len(q_tokens)
++    return overlap if overlap >= 0.6 else 0.0
++
++
++SEARCH_BOX_JS = """
++(() => {
++  const visible = el => {
++    const r = el.getBoundingClientRect();
++    return r.width > 40 && r.height > 10;
++  };
++  const selectors = [
++    'input[aria-label*="Search Messenger" i]',
++    'input[aria-label*="Search" i][type="text"]',
++    'div[role="navigation"] input[type="text"]',
++    'div[role="banner"] input[type="text"]',
++    'input[type="search"]',
++    'input[placeholder*="Search" i]'
++  ];
++  for (const sel of selectors) {
++    for (const el of document.querySelectorAll(sel)) {
++      if (visible(el)) {
++        const r = el.getBoundingClientRect();
++        return {x: r.left + r.width / 2, y: r.top + r.height / 2};
++      }
++    }
++  }
++  return null;
++})()
++"""
++
++
++def search_results_js(query):
++    return f"""
++(() => {{
++  const q = {json.dumps(query)}.toLowerCase();
++  const visible = el => {{
++    const r = el.getBoundingClientRect();
++    return r.width > 40 && r.height > 10;
++  }};
++  const nodes = document.querySelectorAll(
++    '[role="listbox"] [role="option"], [role="grid"] [role="row"], a[href*="/messages/t/"], a[href*="/t/"]'
++  );
++  const out = [];
++  for (const el of nodes) {{
++    if (!visible(el)) continue;
++    const text = (el.innerText || '').trim();
++    if (!text || text.length > 200) continue;
++    if (/^(search|search messenger|messages|new message|see all|people|conversations)$/i.test(text)) continue;
++    const r = el.getBoundingClientRect();
++    out.push({{text: text.replace(/\\s+/g, ' ').slice(0, 160), x: r.left + r.width / 2, y: r.top + r.height / 2}});
++    if (out.length >= 12) break;
++  }}
++  return out;
++}})()
++"""
++
++
++def messenger_list_js(reset=False):
++    """Reports the conversation list, its scroll position and where to wheel it."""
++    return rf"""
++(() => {{
++  const reset = {str(bool(reset)).lower()};
++  const links = Array.from(document.querySelectorAll('a[href*="/messages/t/"], a[href*="/t/"]'))
++    .filter(a => {{
++      const r = a.getBoundingClientRect();
++      return r.width > 120 && r.height > 20;
++    }});
++  if (!links.length) {{
++    return {{ok: false, reason: 'no conversation links on this page', entries: []}};
++  }}
++
++  let scroller = null;
++  for (const a of links) {{
++    let el = a.parentElement;
++    for (let i = 0; i < 15 && el; i++) {{
++      const style = getComputedStyle(el);
++      if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 40) {{
++        scroller = el;
++        break;
++      }}
++      el = el.parentElement;
++    }}
++    if (scroller) break;
++  }}
++
++  if (reset && scroller) scroller.scrollTop = 0;
++
++  const entries = [];
++  const seen = new Set();
++  for (const a of links) {{
++    const href = a.getAttribute('href') || '';
++    if (!href || seen.has(href)) continue;
++    seen.add(href);
++    const raw = (a.innerText || '').trim();
++    if (!raw) continue;
++    entries.push({{
++      href: href,
++      name: raw.split('\n')[0].trim().slice(0, 90),
++      text: raw.replace(/\s+/g, ' ').slice(0, 200)
++    }});
++  }}
++
++  const box = scroller || links[0];
++  const r = box.getBoundingClientRect();
++  return {{
++    ok: true,
++    entries: entries,
++    x: Math.round(r.left + r.width / 2),
++    y: Math.round(r.top + Math.min(r.height / 2, 240)),
++    height: Math.round(r.height),
++    scrollTop: scroller ? Math.round(scroller.scrollTop) : 0,
++    scrollHeight: scroller ? Math.round(scroller.scrollHeight) : 0
++  }};
++}})()
++"""
++
++
++THREAD_JS = r"""
++(() => {
++  const main = document.querySelector('div[role="main"]');
++  if (!main) return {ok: false, title: '', messages: [], empty: false};
++
++  let title = '';
++  const heading = main.querySelector('h1, h2, [role="heading"]');
++  if (heading) title = (heading.innerText || '').trim().split('\n')[0];
++  if (!title) {
++    const link = main.querySelector('a[href*="/messages/t/"], a[href*="/t/"]');
++    if (link) title = (link.innerText || '').trim().split('\n')[0];
++  }
++
++  const mainRect = main.getBoundingClientRect();
++  const rows = Array.from(main.querySelectorAll('[role="row"], [role="listitem"]'));
++  const messages = [];
++  let lastKey = null;
++  for (const row of rows) {
++    const bubble = row.querySelector('div[dir="auto"]') || row.querySelector('span[dir="auto"]');
++    if (!bubble) continue;
++    const text = (bubble.innerText || '').trim();
++    if (!text || text.length > 2000) continue;
++    if (/^(seen|delivered|sent|sending|failed to send|\d{1,2}:\d{2}\s?(am|pm)?)$/i.test(text)) continue;
++
++    const labels = [row.getAttribute('aria-label') || ''];
++    for (const el of row.querySelectorAll('[aria-label]')) labels.push(el.getAttribute('aria-label') || '');
++    const joined = labels.join(' ').toLowerCase();
++    const saidYou = /you sent|sent by you|you:/.test(joined);
++
++    const rect = bubble.getBoundingClientRect();
++    const center = rect.left + rect.width / 2;
++    const out = saidYou || center > mainRect.left + mainRect.width * 0.6;
++
++    const key = text + '|' + out;
++    if (key === lastKey) continue;
++    lastKey = key;
++    messages.push({text: text.replace(/\s+/g, ' '), out: out});
++  }
++
++  const body = (main.innerText || '').toLowerCase();
++  const empty = messages.length === 0 &&
++    /start a conversation|no messages yet|send your first message/.test(body);
++
++  return {ok: true, title: title.replace(/\s+/g, ' '), messages: messages, empty: empty};
++})()
++"""
+ 
+-def calculate_priority(followers_count):
+-    try:
+-        count = int(re.sub(r'[^0-9]', '', str(followers_count)))
+-        if count >= 100:
+-            return "High"
+-        elif count >= 10:
+-            return "Medium"
+-        else:
+-            return "Low"
+-    except Exception:
+-        # If parsing follower count fails, default to Low or Medium
+-        return "Medium"
+ 
+ class TrackerWorker(QThread):
+-    log_signal = pyqtSignal(str, str) # level, message
+-    progress_signal = pyqtSignal(int, str) # percentage, status text
+-    finished_signal = pyqtSignal(bool, str, dict) # success, message, stats
++    log_signal = pyqtSignal(str, str)  # level, message
++    progress_signal = pyqtSignal(int, str)  # percentage, status text
++    finished_signal = pyqtSignal(bool, str, dict)  # success, message, stats
+ 
+     def __init__(self, messenger_tab, prospect_tabs, master_tab, options):
+         super().__init__()
+         self.messenger_tab = messenger_tab
+         self.prospect_tabs = prospect_tabs  # List of prospect tabs selected
+         self.master_tab = master_tab
+-        self.options = options
++        self.options = options or {}
+         self.is_cancelled = False
++        self.problems = []
++        self.thread_index = []  # [{"href", "name", "text"}] from the message list
++        self.thread_scan_ok = False
+ 
++    # -- plumbing -----------------------------------------------------------
+     def log(self, msg, level="info"):
+         self.log_signal.emit(level, msg)
+ 
+     def cancel(self):
+         self.is_cancelled = True
+ 
++    def add_problem(self, message):
++        self.problems.append(message)
++        self.log(f"CHECK FAILED: {message}", "error")
++
++    @staticmethod
++    def _audit(status, is_dmd=False, replied=False, reply_text="", detail=""):
++        return {
++            "status": status,
++            "is_dmd": is_dmd,
++            "replied": replied,
++            "reply_text": reply_text,
++            "detail": detail,
++        }
++
+     def run(self):
+-        asyncio.run(self.run_automation())
++        try:
++            asyncio.run(self.run_automation())
++        except Exception as e:  # last-resort guard so the UI never hangs
++            import traceback
+ 
+-    async def run_automation(self):
+-        self.log("Starting Facebook DM Prospect Tracker Pipeline...", "info")
+-        self.progress_signal.emit(5, "Connecting to Chrome DevTools tabs...")
++            self.log(f"CRITICAL ERROR: {e}", "error")
++            self.log(traceback.format_exc(), "error")
++            self.finished_signal.emit(False, str(e), {})
+ 
++    # -- main pipeline ------------------------------------------------------
++    async def run_automation(self):
+         stats = {
+             "prospects_scanned": 0,
+             "dmd_count": 0,
+             "replied_count": 0,
+-            "not_dmd_removed": 0,
++            "held_count": 0,
+             "master_appended": 0,
+-            "tabs_processed": len(self.prospect_tabs)
++            "unknown_count": 0,
++            "tabs_processed": 0,
++            "tabs_failed": 0,
+         }
+ 
++        total_tabs = len(self.prospect_tabs)
++        self.log("=" * 62, "info")
++        self.log("Facebook DM Prospect Tracker — starting", "info")
++        self.log(f"Prospect sheet(s) selected ({total_tabs}):", "info")
++        for idx, tab in enumerate(self.prospect_tabs, start=1):
++            self.log(f"   {idx}. {tab.get('title', 'Untitled')[:70]}", "info")
++        self.log(f"Messenger tab : {self.messenger_tab.get('title', 'Untitled')[:70]}", "info")
++        self.log(f"   URL        : {self.messenger_tab.get('url', '')[:90]}", "info")
++        self.log(f"Master tab    : {self.master_tab.get('title', 'Untitled')[:70]}", "info")
++        self.log("=" * 62, "info")
++
++        self.progress_signal.emit(5, "Connecting to Chrome DevTools tabs...")
++
+         messenger_cdp = None
+         master_cdp = None
+ 
+         try:
+-            # 1. Connect to Messenger
+-            self.log(f"Connecting to Messenger tab: {self.messenger_tab['title'][:40]}...", "info")
+-            messenger_cdp = CDPClient(self.messenger_tab['webSocketDebuggerUrl'])
+-            await messenger_cdp.connect()
+-            await messenger_cdp.send("Runtime.enable")
+-
+-            # 2. Connect to Master Sheet
+-            self.log(f"Connecting to Master Sheet tab: {self.master_tab['title'][:40]}...", "info")
+-            master_cdp = CDPClient(self.master_tab['webSocketDebuggerUrl'])
+-            await master_cdp.connect()
+-            await master_cdp.send("Runtime.enable")
+-
+-            # Iterate through each selected prospect sheet tab
+-            total_tabs = len(self.prospect_tabs)
++            self.log("Opening DevTools session for the Messenger tab...", "info")
++            messenger_cdp = await connect_tab(self.messenger_tab, "Messenger", log=self.log)
++            self.log("Messenger tab connected.", "success")
++
++            # Build the DM index once, from the real conversation list, so every
++            # prospect is checked against your actual message history.
++            self.progress_signal.emit(8, "Scanning your Messenger conversation list...")
++            self.thread_index = await self.scan_messenger_threads(messenger_cdp)
++            self.thread_scan_ok = bool(self.thread_index)
++            if self.thread_scan_ok:
++                self.log(
++                    f"Indexed {len(self.thread_index)} Messenger conversation(s); "
++                    "each prospect is looked up here first.",
++                    "success",
++                )
++            else:
++                self.log(
++                    "Could not index the Messenger conversation list — falling back to "
++                    "Messenger search for every prospect.",
++                    "warning",
++                )
++
++            self.log("Opening DevTools session for the Master Sheet tab...", "info")
++            master_cdp = await connect_tab(self.master_tab, "Master Sheet", log=self.log)
++            self.log("Master Sheet tab connected.", "success")
++
++            master_doc, master_gid = extract_doc_and_gid(self.master_tab.get("url", ""))
++            if not master_doc:
++                raise CDPError(
++                    "The selected Master Sheet tab is not a Google Sheets document "
++                    f"URL ({self.master_tab.get('url', '')[:80]})."
++                )
++
+             for tab_idx, p_tab in enumerate(self.prospect_tabs):
+                 if self.is_cancelled:
+                     self.log("Task was cancelled by user.", "warning")
+                     break
+ 
+-                self.log(f"\n==========================================", "info")
+-                self.log(f"Processing Sheet [{tab_idx + 1}/{total_tabs}]: {p_tab['title']}", "info")
+-                self.progress_signal.emit(int(10 + (tab_idx / total_tabs) * 80), f"Processing {p_tab['title']}...")
++                span = 85 / max(1, total_tabs)
++                base = 10 + tab_idx * span
++                self.progress_signal.emit(
++                    int(base), f"Processing {p_tab.get('title', 'sheet')[:40]}..."
++                )
+ 
+-                sheet_cdp = CDPClient(p_tab['webSocketDebuggerUrl'])
+-                await sheet_cdp.connect()
+-                await sheet_cdp.send("Runtime.enable")
++                self.log("", "info")
++                self.log("=" * 62, "info")
++                self.log(f"Sheet [{tab_idx + 1}/{total_tabs}]: {p_tab.get('title', 'Untitled')}", "info")
++                self.log("=" * 62, "info")
+ 
++                sheet_cdp = None
+                 try:
+-                    await self.process_single_prospect_tab(sheet_cdp, messenger_cdp, master_cdp, p_tab, stats)
++                    sheet_cdp = await connect_tab(p_tab, "Prospect Sheet", log=self.log)
++                    stats["tabs_processed"] += 1
++                    await self.process_single_prospect_tab(
++                        sheet_cdp, messenger_cdp, master_cdp, p_tab, master_doc, master_gid, stats
++                    )
++                except CDPError as e:
++                    stats["tabs_failed"] += 1
++                    self.add_problem(f"{p_tab.get('title', 'sheet')[:40]}: {e}")
+                 finally:
+-                    await sheet_cdp.close()
++                    if sheet_cdp:
++                        await sheet_cdp.close()
++
++            if self.is_cancelled:
++                self.finished_signal.emit(False, "Cancelled by user.", stats)
++                return
+ 
+-            # 4. Copy 'done' to clipboard as required by prompt
+             self.progress_signal.emit(95, "Setting clipboard and finalizing...")
+-            import subprocess
+-            try:
+-                subprocess.run(["powershell", "-NoProfile", "-Command", "Set-Clipboard -Value 'done'"], check=False)
+-                self.log("PowerShell: 'done' copied to clipboard.", "success")
+-            except Exception as e:
+-                self.log(f"Clipboard note: {e}", "warning")
+-
+-            self.progress_signal.emit(100, "Automation task completed successfully!")
+-            self.log("\n==========================================", "success")
+-            self.log(f"COMPLETED! Processed {stats['prospects_scanned']} prospects across {total_tabs} sheet(s).", "success")
+-            self.log(f"DM'd: {stats['dmd_count']} | Replied: {stats['replied_count']} | Removed: {stats['not_dmd_removed']} | Appended: {stats['master_appended']}", "success")
+-            
+-            self.finished_signal.emit(True, "All tasks completed successfully!", stats)
++            self.copy_done_to_clipboard()
++
++            self.log("", "info")
++            self.log("=" * 62, "success")
++            self.log(
++                f"Scanned {stats['prospects_scanned']} prospect(s) across "
++                f"{stats['tabs_processed']} sheet(s).",
++                "success",
++            )
++            self.log(
++                f"DM'd: {stats['dmd_count']} | Replied: {stats['replied_count']} | "
++                f"Held: {stats['held_count']} | Appended: {stats['master_appended']} | "
++                f"Needs review: {stats['unknown_count']}",
++                "success",
++            )
++
++            if stats["tabs_failed"]:
++                self.add_problem(f"{stats['tabs_failed']} sheet(s) could not be processed.")
++
++            if stats["prospects_scanned"] == 0 and not self.is_cancelled:
++                self.add_problem(
++                    "No prospect rows were found in the selected sheet(s), so nothing "
++                    "was audited. Check the sheet has a header row and data below it."
++                )
+ 
++            if self.problems:
++                self.progress_signal.emit(100, "Finished with problems — see the log.")
++                self.log("Run finished, but with problems:", "error")
++                for problem in self.problems:
++                    self.log(f"  - {problem}", "error")
++                self.finished_signal.emit(
++                    False, "Completed with problems:\n\n" + "\n".join(f"• {p}" for p in self.problems), stats
++                )
++                return
++
++            self.progress_signal.emit(100, "Automation task completed and verified.")
++            self.finished_signal.emit(True, "All tasks completed and verified!", stats)
++
++        except CDPError as e:
++            self.log(f"CRITICAL ERROR: {e}", "error")
++            self.finished_signal.emit(False, str(e), stats)
+         except Exception as e:
+-            self.log(f"CRITICAL ERROR: {str(e)}", "error")
+             import traceback
++
++            self.log(f"CRITICAL ERROR: {e}", "error")
+             self.log(traceback.format_exc(), "error")
+             self.finished_signal.emit(False, str(e), stats)
+         finally:
+@@ -132,68 +446,68 @@ class TrackerWorker(QThread):
+             if master_cdp:
+                 await master_cdp.close()
+ 
+-    async def process_single_prospect_tab(self, sheet_cdp, messenger_cdp, master_cdp, p_tab, stats):
+-        doc_id, gid = extract_doc_and_gid(p_tab['url'])
++    def copy_done_to_clipboard(self):
++        if sys.platform != "win32":
++            self.log("Clipboard: 'done' skipped (not running on Windows).", "warning")
++            return
++        try:
++            flags = 0
++            if hasattr(subprocess, "CREATE_NO_WINDOW"):
++                flags = subprocess.CREATE_NO_WINDOW
++            subprocess.run(
++                ["powershell", "-NoProfile", "-Command", "Set-Clipboard -Value 'done'"],
++                check=False,
++                capture_output=True,
++                creationflags=flags,
++            )
++            self.log("Clipboard: 'done' copied.", "success")
++        except Exception as e:
++            self.log(f"Clipboard note: {e}", "warning")
++
++    # -- one prospect sheet -------------------------------------------------
++    async def process_single_prospect_tab(
++        self, sheet_cdp, messenger_cdp, master_cdp, p_tab, master_doc, master_gid, stats
++    ):
++        doc_id, gid = extract_doc_and_gid(p_tab.get("url", ""))
+         if not doc_id:
+-            # Fallback to prompt doc id if url lacks it
+-            doc_id = "1yLVmUwo0_7nq393HkKY06eyDtI3Bepo6HBOU4Dtm0QY"
+-        self.log(f"Exporting prospect CSV (doc: {doc_id}, gid: {gid})...", "info")
+-
+-        csv_text = await export_sheet_csv(sheet_cdp, doc_id, gid)
+-        if not csv_text or csv_text.startswith("ERROR:"):
+-            self.log(f"Failed to fetch CSV via CDP: {csv_text}. Reading via DOM...", "warning")
+-            csv_text = await sheet_cdp.evaluate("""
+-                (() => {
+-                    const table = [];
+-                    // Extract visible cell content if export blocked
+-                    return '';
+-                })()
+-            """)
+-
+-        rows = []
+-        if csv_text and not csv_text.startswith("ERROR:"):
+-            reader = csv.reader(io.StringIO(csv_text))
+-            rows = [r for r in reader if any(field.strip() for field in r)]
+-
+-        if not rows:
+-            self.log("No rows found in this prospect sheet or sheet is empty.", "warning")
++            raise CDPError(
++                "this tab is not a Google Sheets document "
++                f"({p_tab.get('url', '')[:80]})"
++            )
++
++        self.log(f"Reading sheet (doc {doc_id[:12]}..., gid {gid})...", "info")
++        rows, source = await read_sheet(sheet_cdp, doc_id, gid, log=self.log)
++
++        if len(rows) < 2:
++            self.log("This sheet only has a header row — nothing to audit.", "warning")
+             return
+ 
+         header = rows[0]
+-        self.log(f"Found {len(rows)-1} prospect rows. Header: {header[:6]}", "info")
+-
+-        # Map header columns
+-        col_map = {}
+-        for idx, col_name in enumerate(header):
+-            clean = col_name.strip().lower()
+-            if "company" in clean or "business" in clean or "name" in clean and "company" not in col_map:
+-                col_map["company"] = idx
+-            elif "facebook" in clean or "social" in clean or "fb" in clean or "profile" in clean:
+-                col_map["facebook"] = idx
+-            elif "website" in clean or "site" in clean or "url" in clean:
+-                col_map["website"] = idx
+-            elif "email" in clean:
+-                col_map["email"] = idx
+-            elif "phone" in clean:
+-                col_map["phone"] = idx
+-            elif "follower" in clean or "count" in clean:
+-                col_map["followers"] = idx
+-            elif "location" in clean or "city" in clean or "address" in clean:
+-                col_map["location"] = idx
+-
+-        # Sensible defaults if exact column headers differ
+-        if "company" not in col_map and len(header) > 0: col_map["company"] = 0
+-        if "facebook" not in col_map and len(header) > 1: col_map["facebook"] = 1
+-        if "website" not in col_map and len(header) > 2: col_map["website"] = 2
+-        if "email" not in col_map and len(header) > 3: col_map["email"] = 3
+-        if "phone" not in col_map and len(header) > 4: col_map["phone"] = 4
+-        if "followers" not in col_map and len(header) > 5: col_map["followers"] = 5
+-        if "location" not in col_map and len(header) > 6: col_map["location"] = 6
+-
+-        prospects_to_keep = []
+-        rows_to_delete = []
+-
+-        # Audit Messenger for each prospect
++        cols = map_columns(header)
++        self.log(f"Header ({len(header)} column(s)): {header}", "info")
++        mapping_text = ", ".join(
++            f"{field}->{column_letter(idx)}" for field, idx in sorted(cols.items())
++        )
++        self.log(f"Column mapping: {mapping_text}", "info")
++        self.log(f"{len(rows) - 1} prospect row(s) found via {source}.", "info")
++
++        if "facebook" not in cols and "company" not in cols:
++            self.log(
++                "No company/facebook column detected; falling back to the first column.",
++                "warning",
++            )
++
++        def cell(row, field):
++            idx = cols.get(field)
++            if idx is None or idx >= len(row):
++                return ""
++            return row[idx]
++
++        to_keep = []        # (original row index, master record)
++        held_rows = []      # (original row index, label) — kept, never deleted
++        unknown_rows = []
++        total_rows = len(rows) - 1
++
+         await messenger_cdp.bring_to_front()
+ 
+         for row_idx in range(1, len(rows)):
+@@ -201,227 +515,485 @@ class TrackerWorker(QThread):
+                 return
+ 
+             row = rows[row_idx]
+-            company = row[col_map["company"]] if "company" in col_map and len(row) > col_map["company"] else ""
+-            fb_link = row[col_map["facebook"]] if "facebook" in col_map and len(row) > col_map["facebook"] else ""
+-            website = row[col_map["website"]] if "website" in col_map and len(row) > col_map["website"] else ""
+-            email = row[col_map["email"]] if "email" in col_map and len(row) > col_map["email"] else ""
+-            phone = row[col_map["phone"]] if "phone" in col_map and len(row) > col_map["phone"] else ""
+-            followers = row[col_map["followers"]] if "followers" in col_map and len(row) > col_map["followers"] else "0"
+-            location = row[col_map["location"]] if "location" in col_map and len(row) > col_map["location"] else ""
++            company = cell(row, "company")
++            fb_link = cell(row, "facebook")
++            website = cell(row, "website")
++            email = cell(row, "email")
++            phone = cell(row, "phone")
++            followers = cell(row, "followers")
++            location = cell(row, "location")
+ 
+             if not company and not fb_link:
++                self.log(f"Row {row_idx + 1}: empty, skipped.", "info")
++                continue
++
++            term = search_term(company, fb_link)
++            if not term:
++                self.log(f"Row {row_idx + 1}: no name or profile link, skipped.", "warning")
+                 continue
+ 
+             stats["prospects_scanned"] += 1
+-            self.log(f"Checking prospect [{row_idx}]: '{company or fb_link}' in Messenger...", "info")
+-
+-            # Check Messenger for DM status and reply
+-            audit_result = await self.audit_messenger_conversation(messenger_cdp, company, fb_link)
+-            
+-            is_dmd = audit_result["is_dmd"]
+-            replied = audit_result["replied"]
+-            reply_text = audit_result["reply_text"]
+-
+-            if is_dmd:
+-                stats["dmd_count"] += 1
+-                if replied:
+-                    stats["replied_count"] += 1
+-                    status = "Hot - Follow Up"
+-                    note_lead = f'Replied "{reply_text}".'
+-                else:
+-                    status = "Pending"
+-                    note_lead = "No reply yet."
+-
+-                priority = calculate_priority(followers)
+-                today_str = datetime.now().strftime("%b %d, %Y")
+-                notes = f"{note_lead} DM'd via Messenger {today_str}. {followers} followers; {location}".strip()
+-                if not website:
+-                    website_val = "no real site"
+-                else:
+-                    website_val = website
+-
+-                master_record = {
+-                    "date": today_str,
+-                    "status": status,
+-                    "priority": priority,
+-                    "owner": "",
+-                    "company": company,
+-                    "social_link": fb_link,
+-                    "website": website_val,
+-                    "email": email,
+-                    "phone": phone,
+-                    "followups": "",
+-                    "last_contacted": "",
+-                    "notes": notes
+-                }
+-                prospects_to_keep.append((row_idx, master_record))
+-                self.log(f" -> DM FOUND! Status: {status} | Priority: {priority} | Reply: '{reply_text}'", "success")
++            label = company or term
++            self.log(
++                f"[{row_idx}/{total_rows}] Checking '{label}' in Messenger "
++                f"(followers: {followers or 'n/a'})...",
++                "info",
++            )
++
++            audit = await self.audit_messenger_conversation(messenger_cdp, term)
++
++            if audit["status"] == "error":
++                stats["unknown_count"] += 1
++                unknown_rows.append(row_idx)
++                self.log(
++                    f"   -> Could not verify '{label}': {audit['detail']}. "
++                    f"Row left untouched for manual review.",
++                    "error",
++                )
++                continue
++
++            if not audit["is_dmd"]:
++                stats["held_count"] += 1
++                held_rows.append((row_idx, label))
++                self.log(
++                    f"   -> NOT DM'd ({audit['detail']}). Row kept and marked HOLD.",
++                    "warning",
++                )
++                continue
++
++            stats["dmd_count"] += 1
++            if audit["replied"]:
++                stats["replied_count"] += 1
++                status = "Hot - Follow Up"
++                note_lead = f'Replied "{audit["reply_text"]}".'
+             else:
+-                stats["not_dmd_removed"] += 1
+-                rows_to_delete.append(row_idx)
+-                self.log(f" -> NOT DM'd. Marked for deletion from daily sheet.", "warning")
++                status = "Pending"
++                note_lead = "No reply yet."
++
++            today_str = datetime.now().strftime("%b %d, %Y")
++            priority = calculate_priority(followers)
++            notes = f"{note_lead} DM'd via Messenger {today_str}."
++            if followers:
++                notes += f" {followers} followers;"
++            if location:
++                notes += f" {location}"
++            notes = notes.strip()
+ 
+-        # Phase 2: Edit Daily Sheet (Delete rows of un-contacted prospects)
+-        if rows_to_delete:
+-            self.log(f"\nPhase 2: Removing {len(rows_to_delete)} uncontacted rows from daily sheet...", "info")
++            record = {
++                "date": today_str,
++                "status": status,
++                "priority": priority,
++                "owner": "",
++                "company": company or term,
++                "social_link": fb_link,
++                "website": website if website else "no real site",
++                "email": email,
++                "phone": phone,
++                "followups": "",
++                "last_contacted": "",
++                "notes": notes,
++            }
++            to_keep.append((row_idx, record))
++            self.log(
++                f"   -> DM CONFIRMED. Status: {status} | Priority: {priority}"
++                + (f" | Reply: \"{audit['reply_text'][:80]}\"" if audit["replied"] else ""),
++                "success",
++            )
++
++            done = row_idx
++            fraction = done / max(1, total_rows)
++            self.progress_signal.emit(
++                int(10 + (fraction * 35)), f"Audited {done}/{total_rows}: {label[:30]}"
++            )
++
++        # Phase 2 — keep the un-contacted rows and flag them (no deletions)
++        if held_rows:
++            self.log("", "info")
++            self.log(
++                f"Phase 2: keeping {len(held_rows)} un-contacted row(s) and marking them HOLD...",
++                "info",
++            )
+             await sheet_cdp.bring_to_front()
+-            await self.delete_sheet_rows(sheet_cdp, rows_to_delete, rows)
++            self.progress_signal.emit(52, "Marking un-contacted rows as HOLD...")
++            hold_letter, hold_idx = await self.mark_rows_held(
++                sheet_cdp, rows, header, cols, held_rows
++            )
++            if hold_letter:
++                self.progress_signal.emit(58, "Verifying held rows...")
++                await self.verify_holds(
++                    sheet_cdp, doc_id, gid, held_rows, hold_letter, hold_idx
++                )
++        else:
++            self.log("Phase 2: no un-contacted rows in this sheet.", "info")
+ 
+-        # Phase 3: Append DM'd prospects to Master Sheet
+-        if prospects_to_keep:
+-            self.log(f"\nPhase 3: Appending {len(prospects_to_keep)} DM'd prospects to Master Tracking Sheet...", "info")
++        # Phase 3 — append to the master sheet
++        if to_keep:
++            self.log("", "info")
++            self.log(f"Phase 3: appending {len(to_keep)} record(s) to the Master Sheet...", "info")
+             await master_cdp.bring_to_front()
+-            await self.append_to_master_sheet(master_cdp, [p[1] for p in prospects_to_keep], stats)
++            await self.append_to_master_sheet(
++                master_cdp, master_doc, master_gid, [r for _, r in to_keep], stats
++            )
++            self.progress_signal.emit(85, "Verifying Master Sheet rows...")
++            await self.verify_master_appends(
++                master_cdp, master_doc, master_gid, [r for _, r in to_keep], stats
++            )
+         else:
+-            self.log("No DM'd prospects to append to master sheet from this tab.", "info")
++            self.log("Phase 3: no DM'd prospects to append from this sheet.", "info")
+ 
+-    async def audit_messenger_conversation(self, messenger_cdp, company_name, fb_url):
+-        """
+-        Inspects the open Messenger conversation tab:
+-        Searches or selects thread matching company name or verifies existing thread.
+-        Extracts last outgoing message and whether an incoming reply exists.
++        if unknown_rows:
++            self.log(
++                f"{len(unknown_rows)} row(s) could not be verified and were left alone: "
++                + ", ".join(str(i + 1) for i in unknown_rows),
++                "warning",
++            )
++
++    # -- messenger conversation list ---------------------------------------
++    async def scan_messenger_threads(self, messenger_cdp):
+         """
+-        search_query = company_name.replace('"', '\\"') if company_name else ""
+-
+-        check_script = f"""
+-        (() => {{
+-            // Look for thread list and messages in active chat
+-            const bodyText = document.body.innerText || '';
+-            const query = "{search_query}".toLowerCase();
+-            
+-            // Check message bubbles
+-            // In Facebook / Messenger, incoming vs outgoing bubbles:
+-            // Outgoing messages typically have specific aria-labels or class structure
+-            const messageRows = Array.from(document.querySelectorAll('[role="row"], [role="presentation"]'));
+-            
+-            // Search if search bar exists
+-            let isDmd = false;
+-            let replied = false;
+-            let replyText = "";
+-
+-            // Check if thread contains sent message
+-            // Look for patterns like "You sent", delivered icons, or message nodes
+-            const outgoing = document.querySelectorAll('[data-scope="messages_table"] div, div[dir="auto"]');
+-            
+-            // Heuristic check from Messenger DOM:
+-            const textContent = bodyText.toLowerCase();
+-            if (query && textContent.includes(query)) {{
+-                // Found conversation relevance
+-                isDmd = true;
+-            }}
+-            
+-            // Detect reply: affirmative terms like 'yes', 'dfw', 'sure', 'interested', etc.
+-            const affirmative = ["yes", "dfw", "we do", "sure", "sounds good", "thanks", "hello", "hey"];
+-            for (const word of affirmative) {{
+-                if (textContent.includes(word)) {{
+-                    replied = true;
+-                    replyText = word.toUpperCase();
+-                    break;
+-                }}
+-            }}
+-
+-            // If query is empty or couldn't confirm explicitly via DOM, fall back to checking if active conversation has outgoing bubbles
+-            if (!isDmd) {{
+-                // Check if any sent messages exist in viewport
+-                const sentCheck = document.querySelector('[aria-label*="Sent"], [aria-label*="Delivered"], [aria-label*="Seen"]');
+-                if (sentCheck) {{
+-                    isDmd = true;
+-                }}
+-            }}
+-
+-            return {{
+-                is_dmd: isDmd,
+-                replied: replied,
+-                reply_text: replyText || (replied ? "Confirmed" : "")
+-            }};
+-        }})()
++        Scrolls the real Messenger conversation list from the top, pausing after
++        every scroll so the next batch can render, and indexes every thread.
+         """
++        self.log("Reading your Messenger conversation list...", "info")
+         try:
+-            res = await messenger_cdp.evaluate(check_script)
+-            if isinstance(res, dict):
+-                return {
+-                    "is_dmd": res.get("is_dmd", False),
+-                    "replied": res.get("replied", False),
+-                    "reply_text": res.get("reply_text", "")
+-                }
+-        except Exception as e:
+-            self.log(f"Messenger inspect warning: {e}", "warning")
++            listing = await messenger_cdp.evaluate(messenger_list_js(reset=True))
++        except CDPError as e:
++            self.add_problem(f"could not read the Messenger conversation list: {e}")
++            return []
++
++        if not isinstance(listing, dict) or not listing.get("ok"):
++            reason = listing.get("reason") if isinstance(listing, dict) else None
++            self.add_problem(
++                "could not read the Messenger conversation list"
++                + (f": {reason}" if reason else " (is facebook.com/messages open and loaded?)")
++            )
++            return []
++
++        indexed = {}
++        last_height = listing.get("scrollHeight") or 0
++        stagnant = 0
++        passes = 0
++        await asyncio.sleep(SCAN_PAUSE)
++
++        while passes < SCAN_MAX_PASSES and not self.is_cancelled:
++            before = len(indexed)
++            for entry in listing.get("entries") or []:
++                href = (entry.get("href") or "").strip()
++                name = (entry.get("name") or "").strip()
++                if href and name and href not in indexed:
++                    indexed[href] = {
++                        "href": href,
++                        "name": name,
++                        "text": entry.get("text", ""),
++                    }
++            gained = len(indexed) - before
++
++            height = listing.get("scrollHeight") or 0
++            grew = height > last_height
++            last_height = max(height, last_height)
++            stagnant = 0 if (gained or grew) else stagnant + 1
++
++            self.log(
++                f"   list pass {passes + 1}: {len(indexed)} conversation(s) loaded"
++                + (f" (+{gained})" if gained else "")
++                + (", scrolling for more..." if stagnant == 0 else ", nothing new yet..."),
++                "info",
++            )
++            if stagnant >= SCAN_STAGNANT_PASSES:
++                break
++
++            try:
++                await messenger_cdp.scroll_at(
++                    listing.get("x", 400),
++                    listing.get("y", 400),
++                    SCAN_WHEEL_DELTA,
++                    times=1,
++                    pause=0.0,
++                )
++            except CDPError as e:
++                self.log(f"   could not scroll the conversation list: {e}", "warning")
++                break
++
++            passes += 1
++            await asyncio.sleep(SCAN_PAUSE)
++            try:
++                listing = await messenger_cdp.evaluate(messenger_list_js())
++            except CDPError as e:
++                self.log(f"   stopped reading the conversation list: {e}", "warning")
++                break
++            if not isinstance(listing, dict) or not listing.get("ok"):
++                break
+ 
+-        # Default fallback if tab state is standard
+-        return {"is_dmd": True, "replied": False, "reply_text": ""}
++        threads = list(indexed.values())
++        if threads:
++            self.log(
++                f"Messenger scan: {len(threads)} conversation(s) indexed in "
++                f"{passes + 1} pass(es).",
++                "success",
++            )
++        return threads
+ 
+-    async def delete_sheet_rows(self, sheet_cdp, row_indices, original_rows):
++    def find_thread(self, term):
++        best = None
++        best_score = 0.0
++        for thread in self.thread_index:
++            score = thread_score(term, thread.get("name", ""))
++            if score <= 0:
++                score = thread_score(term, thread.get("text", "")) * 0.9
++            if score > best_score:
++                best, best_score = thread, score
++        return best
++
++    # -- messenger audit ----------------------------------------------------
++    async def open_thread(self, messenger_cdp, href):
++        base = self.messenger_tab.get("url") or "https://www.facebook.com/messages/"
++        target = urljoin(base, href)
++        self.log(f"   opening {target[:90]} ...", "info")
++        try:
++            await messenger_cdp.navigate(target)
++        except CDPError as e:
++            raise CDPError(f"could not open the conversation: {e}")
++
++        thread = None
++        for attempt in range(3):
++            await asyncio.sleep(2.5 if attempt == 0 else 2.0)
++            try:
++                thread = await messenger_cdp.evaluate(THREAD_JS)
++            except CDPError:
++                continue
++            if isinstance(thread, dict) and thread.get("ok") and (
++                thread.get("messages") or thread.get("empty")
++            ):
++                return thread
++        return thread
++
++    def classify_thread(self, thread, name):
++        if not isinstance(thread, dict) or not thread.get("ok"):
++            return self._audit("error", detail="the conversation pane did not load")
++
++        title = thread.get("title") or name
++        messages = thread.get("messages") or []
++        if not messages:
++            if thread.get("empty"):
++                return self._audit("ok", detail=f"'{name}' has a thread but no messages from us")
++            return self._audit("error", detail="the opened conversation showed no readable messages")
++
++        is_dmd, replied, reply_text, incoming = analyze_thread(messages)
++        self.log(
++            f"   read {len(messages)} message(s) from '{title}'; last message was "
++            f"{'ours' if messages[-1].get('out') else 'theirs'}.",
++            "info",
++        )
++
++        if is_dmd:
++            detail = f"thread '{title}'"
++        elif incoming:
++            detail = "they messaged first, but we never sent a DM"
++        else:
++            detail = f"thread '{title}' has no message from us"
++
++        return self._audit("ok", is_dmd, replied, reply_text, detail)
++
++    async def audit_messenger_conversation(self, messenger_cdp, search_text):
+         """
+-        Delete rows safely in reverse order using Google Sheets row header context menu
+-        or via batch API/delete command with verification.
++        Looks the prospect up in the indexed conversation list, opens that thread
++        and reads it. Only falls back to Messenger search when the scan did not
++        see them.
+         """
+-        # Delete from bottom to top so indices don't shift
+-        sorted_rows = sorted(row_indices, reverse=True)
+-        for r_idx in sorted_rows:
+-            if self.is_cancelled:
+-                return
+-            expected_content = original_rows[r_idx][0] if r_idx < len(original_rows) and len(original_rows[r_idx]) > 0 else ""
+-            self.log(f"Deleting row {r_idx + 1} (Expected: '{expected_content[:25]}')...", "info")
+-
+-            # Click row number header (x ≈ 20, y = 176 + (r_idx-1)*20 at 100% zoom)
+-            y_coord = 176 + (r_idx - 1) * 20
+-            if y_coord < 800:
+-                # Right click row header to bring context menu
+-                await sheet_cdp.click(20, y_coord, count=1, button="right")
+-                await asyncio.sleep(0.4)
+-                
+-                # Click Delete Row menuItem in Google Sheets context menu
+-                deleted = await sheet_cdp.evaluate("""
+-                    (() => {
+-                        const items = Array.from(document.querySelectorAll('.goog-menuitem, [role="menuitem"]'));
+-                        for (const it of items) {
+-                            if (it.innerText && it.innerText.toLowerCase().includes('delete row')) {
+-                                const rect = it.getBoundingClientRect();
+-                                it.click();
+-                                return true;
+-                            }
+-                        }
+-                        return false;
+-                    })()
+-                """)
+-                await asyncio.sleep(0.8)
+-                if deleted:
+-                    self.log(f"Row {r_idx + 1} deleted successfully.", "success")
+-                else:
+-                    self.log(f"Context menu delete clicked via hotkey fallback.", "info")
+-                    await sheet_cdp.escape_revert()
+-
+-    async def append_to_master_sheet(self, master_cdp, records, stats):
++        url = (self.messenger_tab.get("url") or "").lower()
++        if "facebook.com" not in url and "messenger.com" not in url:
++            return self._audit(
++                "error", detail="the Messenger tab is not a Facebook Messenger page"
++            )
++
++        thread = self.find_thread(search_text)
++        if thread:
++            self.log(f"   found in your message list as '{thread['name']}'.", "info")
++            try:
++                data = await self.open_thread(messenger_cdp, thread["href"])
++            except CDPError as e:
++                return self._audit("error", detail=str(e))
++            result = self.classify_thread(data, thread["name"] or search_text)
++            if result["status"] != "error":
++                return result
++            self.log(
++                f"   could not read that thread ({result['detail']}); trying search instead.",
++                "warning",
++            )
++        elif self.thread_index:
++            self.log("   not found in the scanned message list; trying search...", "warning")
++
++        result = await self.search_for_thread(messenger_cdp, search_text)
++        if (
++            result["status"] == "ok"
++            and not result["is_dmd"]
++            and not self.thread_scan_ok
++        ):
++            return self._audit(
++                "error",
++                detail=(
++                    "not found in your message history, and the conversation list "
++                    "could not be scanned"
++                ),
++            )
++        return result
++
++    async def search_for_thread(self, messenger_cdp, search_text):
++        try:
++            box = await messenger_cdp.evaluate(SEARCH_BOX_JS)
++            if not box:
++                return self._audit(
++                    "error",
++                    detail="the Messenger search box was not found (is the tab fully loaded?)",
++                )
++
++            await messenger_cdp.click(box["x"], box["y"])
++            await asyncio.sleep(0.3)
++            await messenger_cdp.select_all()
++            await messenger_cdp.type_text(search_text)
++
++            results = []
++            for _ in range(3):
++                await asyncio.sleep(2.5)
++                results = await messenger_cdp.evaluate(search_results_js(search_text))
++                if isinstance(results, list) and results:
++                    break
++
++            if not isinstance(results, list) or not results:
++                return self._audit(
++                    "ok", detail="no conversation with this prospect in your message history"
++                )
++
++            best = next(
++                (r for r in results if name_matches(search_text, r.get("text", ""))), None
++            )
++            if not best:
++                return self._audit(
++                    "ok", detail=f"search results did not match '{search_text}'"
++                )
++
++            await messenger_cdp.click(best["x"], best["y"])
++            await asyncio.sleep(3.0)
++            thread = await messenger_cdp.evaluate(THREAD_JS)
++            title = (thread or {}).get("title") or best.get("text", "")
++            if title and not name_matches(search_text, title, threshold=0.4):
++                return self._audit(
++                    "ok", detail=f"opened conversation was '{title}', not the prospect"
++                )
++            return self.classify_thread(thread, title or search_text)
++
++        except CDPError as e:
++            return self._audit("error", detail=str(e))
++
++    # -- daily sheet: hold instead of delete -------------------------------
++    async def mark_rows_held(self, sheet_cdp, rows, header, cols, held_rows):
+         """
+-        Append records to Master sheet tab (A: Initial Contact Date, B: Status, C: Priority,
+-        D: Owner, E: Company, F: Social, G: Website, H: Email, I: Phone, J: Follow-ups, K: Last, L: Notes)
+-        Follows the exact formula bar focused recipe from the technical playbook.
++        Writes a HOLD marker next to every row that was never DM'd. The rows
++        themselves are left exactly where they are.
+         """
+-        doc_id, gid = extract_doc_and_gid(self.master_tab['url'])
+-        if not doc_id:
+-            doc_id = "1PWKCMwBxw7r6SS_r9UPpk7Re2jgH-0Vj"
+-            gid = "594652950"
++        hold_idx = None
++        for idx, name in enumerate(header):
++            if "hold" in norm(name).lower():
++                hold_idx = idx
++                break
++
++        if hold_idx is None:
++            used = max(
++                [len(header)]
++                + [len(r) for r in rows]
++                + [idx + 1 for idx in cols.values()]
++            )
++            hold_idx = used
++            letter = column_letter(hold_idx)
++            self.log(
++                f"No Hold column in the header; adding one in column {letter}.", "info"
++            )
++            try:
++                await self.write_sheet_cell(sheet_cdp, letter, 1, "Hold")
++            except CDPError as e:
++                self.add_problem(f"could not create the Hold column: {e}")
++                return None, None
++
++        letter = column_letter(hold_idx)
++        marker = f"{HOLD_PREFIX} {datetime.now().strftime('%d %b')}"
++        for row_idx, label in held_rows:
++            if self.is_cancelled:
++                break
++            try:
++                await self.write_sheet_cell(sheet_cdp, letter, row_idx + 1, marker)
++                await asyncio.sleep(0.1)
++                self.log(
++                    f"Row {row_idx + 1} kept and marked '{marker}' ({label[:45]}).",
++                    "success",
++                )
++            except CDPError as e:
++                self.add_problem(
++                    f"could not mark row {row_idx + 1} ({label[:40]}) as held: {e}"
++                )
++        return letter, hold_idx
++
++    async def verify_holds(self, sheet_cdp, doc_id, gid, held_rows, hold_letter, hold_idx):
++        if not held_rows or hold_idx is None:
++            return
++        try:
++            rows, _ = await read_sheet(sheet_cdp, doc_id, gid, log=None)
++        except CDPError as e:
++            self.add_problem(f"could not verify the held rows: {e}")
++            return
+ 
+-        # 1. Fetch CSV to find the first empty row below header
+-        csv_text = await export_sheet_csv(master_cdp, doc_id, gid)
+-        master_rows = parse_csv(csv_text) if csv_text and not csv_text.startswith("ERROR:") else []
+-        start_row_num = len(master_rows) + 1
+-        if start_row_num < 2:
+-            start_row_num = 2  # Row 1 is header
++        by_text = {}
++        for row in rows[1:]:
++            key = norm(" | ".join(row)).lower()
++            if key:
++                by_text[key] = row
+ 
+-        self.log(f"Master Sheet currently has {len(master_rows)} rows. Appending starting at row {start_row_num}...", "info")
++        present = 0
++        marked = 0
++        for row_idx, label in held_rows:
++            name = norm(label).lower()
++            match = next((r for k, r in by_text.items() if name and name in k), None)
++            if match is None:
++                self.add_problem(
++                    f"'{label}' disappeared from the daily sheet — held rows must stay"
++                )
++                continue
++            present += 1
++            cell_value = match[hold_idx] if hold_idx < len(match) else ""
++            if norm(cell_value).upper().startswith(HOLD_PREFIX):
++                marked += 1
++            else:
++                self.add_problem(
++                    f"'{label}' is still in the sheet but column {hold_letter} "
++                    f"was not marked {HOLD_PREFIX}"
++                )
++
++        self.log(
++            f"Hold check: {present}/{len(held_rows)} row(s) still in the sheet, "
++            f"{marked}/{len(held_rows)} marked {HOLD_PREFIX} in column {hold_letter}.",
++            "success" if present == marked == len(held_rows) else "warning",
++        )
++
++    # -- master sheet append ------------------------------------------------
++    async def append_to_master_sheet(self, master_cdp, doc_id, gid, records, stats):
++        rows, _ = await read_sheet(master_cdp, doc_id, gid, log=self.log)
++        last_data_row = len(rows)  # rows[0] is the header => next free row is len+1
++        start_row = max(2, last_data_row + 1)
++        self.log(
++            f"Master Sheet has {max(0, len(rows) - 1)} existing row(s); "
++            f"writing from row {start_row}.",
++            "info",
++        )
+ 
+-        # Column configuration:
+-        # A: Date, B: Status, C: Priority, D: Owner (blank), E: Company, F: Social, G: Website, H: Email, I: Phone, J: (blank), K: (blank), L: Notes
+         for i, rec in enumerate(records):
+             if self.is_cancelled:
+                 return
+-
+-            current_row = start_row_num + i
+-            self.log(f"Writing record {i + 1}/{len(records)} into Row {current_row}: '{rec['company']}'...", "info")
+-
+-            # Batch write cells using formula bar & clipboard/type commands
+-            row_cells = [
++            current_row = start_row + i
++            self.log(
++                f"Writing record {i + 1}/{len(records)} to row {current_row}: "
++                f"'{rec['company'] or rec['social_link']}'",
++                "info",
++            )
++            cells = [
+                 ("A", rec["date"]),
+                 ("B", rec["status"]),
+                 ("C", rec["priority"]),
+@@ -430,77 +1002,60 @@ class TrackerWorker(QThread):
+                 ("G", rec["website"]),
+                 ("H", rec["email"]),
+                 ("I", rec["phone"]),
+-                ("L", rec["notes"])
++                ("L", rec["notes"]),
+             ]
++            for col_letter, value in cells:
++                if not value:
++                    continue
++                await self.write_sheet_cell(master_cdp, col_letter, current_row, value)
++                await asyncio.sleep(0.05)
++            stats["master_appended"] += 1
+ 
+-            # Write values into the row
+-            for col_letter, val in row_cells:
+-                await self.write_sheet_cell(master_cdp, col_letter, current_row, val)
+-                await asyncio.sleep(0.08)
++        self.log(
++            f"{len(records)} record(s) written; verifying against the sheet...", "info"
++        )
+ 
+-            stats["master_appended"] += 1
+-            self.log(f"Row {current_row} committed and verified for '{rec['company']}'.", "success")
++    async def write_sheet_cell(self, tab, col_letter, row_num, value):
++        text = str(value)
++        if text.startswith("="):
++            text = "'" + text  # avoid accidental formula injection
++        cell_ref = f"{col_letter}{row_num}"
+ 
+-    async def write_sheet_cell(self, tab: CDPClient, col_letter, row_num, value):
+-        """
+-        Executes the proven recipe:
+-        1. Select cell or navigate to it using Sheets Name Box or grid coordinate
+-        2. Focus formula bar
+-        3. Select all & type value
+-        4. Commit with Enter sequence
+-        """
+-        if not value:
++        shown = await tab.set_name_box(cell_ref)
++        if shown.replace("$", "").upper() != cell_ref.upper():
++            raise CDPError(
++                f"could not select {cell_ref} (name box shows '{shown}')"
++            )
++
++        await tab.type_text(text)
++        await asyncio.sleep(0.1)
++        await tab.press_enter()
++        await asyncio.sleep(0.15)
++
++    async def verify_master_appends(self, master_cdp, doc_id, gid, records, stats):
++        try:
++            rows, _ = await read_sheet(master_cdp, doc_id, gid, log=None)
++        except CDPError as e:
++            self.add_problem(f"could not verify the Master Sheet writes: {e}")
+             return
+ 
+-        cell_ref = f"{col_letter}{row_num}"
+-        # Navigate to cell via namebox for absolute accuracy without pixel coordinate guessing
+-        nav_script = f"""
+-        (async () => {{
+-            const nameBox = document.querySelector('.waffle-name-box') || document.querySelector('#t-name-box');
+-            if (nameBox) {{
+-                nameBox.focus();
+-                nameBox.value = '{cell_ref}';
+-                nameBox.dispatchEvent(new Event('input', {{ bubbles: true }}));
+-                nameBox.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', keyCode: 13, bubbles: true }}));
+-                return true;
+-            }}
+-            return false;
+-        }})()
+-        """
+-        await tab.evaluate(nav_script)
+-        await asyncio.sleep(0.2)
+-
+-        # Focus formula bar and set value
+-        write_script = f"""
+-        (async () => {{
+-            const fb = document.querySelector('#t-formula-bar-input .cell-input');
+-            if (fb) {{
+-                fb.focus();
+-                const range = document.createRange();
+-                range.selectNodeContents(fb);
+-                const sel = window.getSelection();
+-                sel.removeAllRanges();
+-                sel.addRange(range);
+-                return true;
+-            }}
+-            return false;
+-        }})()
+-        """
+-        focused = await tab.evaluate(write_script)
+-        if focused:
+-            await tab.type_text(value)
+-            await asyncio.sleep(0.05)
+-            await tab.commit_enter()
+-            await asyncio.sleep(0.1)
+-        else:
+-            # Fallback direct grid write
+-            fallback_script = f"""
+-            (() => {{
+-                const ed = document.querySelector('#waffle-rich-text-editor');
+-                if (ed) {{
+-                    ed.innerText = `{value}`;
+-                }}
+-            }})()
+-            """
+-            await tab.evaluate(fallback_script)
+-            await tab.commit_enter()
++        # Company lives in column E (index 4), social link in F (index 5)
++        written_cells = set()
++        for row in rows[1:]:
++            for cell in row:
++                written_cells.add(norm(cell).lower())
++
++        verified = 0
++        for rec in records:
++            company = norm(rec["company"]).lower()
++            if company and company in written_cells:
++                verified += 1
++            else:
++                self.add_problem(
++                    f"'{rec['company'] or rec['social_link']}' was not found in the Master Sheet"
++                )
++
++        self.log(
++            f"Master verification: {verified}/{len(records)} record(s) confirmed in the sheet.",
++            "success" if verified == len(records) else "error",
++        )
